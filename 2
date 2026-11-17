@@ -1,0 +1,842 @@
+# %% ==================== CELL 1: IMPORTS (run once) ====================
+import os, glob, warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn import datasets
+from sklearn.model_selection import train_test_split, cross_val_score, KFold, StratifiedKFold, GridSearchCV
+from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler, OneHotEncoder, normalize
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from sklearn.naive_bayes import GaussianNB, MultinomialNB
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.multiclass import OneVsOneClassifier, OneVsRestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC, LinearSVC
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor, plot_tree
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.cluster import KMeans
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.utils.class_weight import compute_sample_weight
+from sklearn.metrics import (accuracy_score, classification_report, confusion_matrix, roc_auc_score, roc_curve,
+                             precision_score, recall_score, f1_score, log_loss,
+                             mean_absolute_error, mean_squared_error, r2_score)
+try:
+    from xgboost import XGBClassifier
+    HAS_XGB = True
+except ImportError:
+    from sklearn.ensemble import GradientBoostingClassifier as XGBClassifier
+    HAS_XGB = False
+warnings.filterwarnings("ignore")
+
+
+# %% ==================== CELL 2: CONFIG (the only cell you edit) ====================
+# STEP 1 - full path of the CSV or Excel file from the question ("" = use the task's built-in data, e.g. iris).
+#          Every line must start at the far left - no space before the name.
+DATA_PATH = r""
+DATA_PATH_2 = r""          # ONLY for the "data_cleaning" task (2nd file to merge, e.g. purchases.csv). All other tasks: leave ""
+
+# STEP 2 - uncomment ONLY the task(s) the question asks for.     class result with the class data
+TASKS = [
+    # "simple_linear",     # Linear Regression, 1 feature (FuelConsumptionCo2)       MAE 24.10  RMSE 31.40  R2 0.76
+    # "multiple_linear",   # Multiple Linear Regression + scaling (Fuel)              coef [23.42 10.36 -29.14]
+    # "tree_regressor",    # Decision Tree Regressor + L1 normalize (yellow_tripdata)  MSE 24.555  R2 0.028
+    # "logistic",          # Logistic Regression + log loss (ChurnData)                log loss 0.6258
+    # "ovr_ovo",           # Logistic Regression One-vs-All / One-vs-One (Obesity)     76.12 % / 92.20 %
+    # "knn",               # KNN + best-k curve (teleCust1000t)                        k=4 0.325, best k=3 0.365
+    # "svm",               # SVM rbf + decision boundary            default: iris      96.67 %
+    # "decision_tree",     # Decision Tree + plot_tree (drug200)    default: iris      drug 0.9833 / iris 1.0
+    # "imbalanced",        # weighted Decision Tree vs LinearSVC, ROC-AUC (creditcard) 0.939 / 0.986
+    # "gaussian_nb",       # Gaussian Naive Bayes                   default: iris      100 % / creditcard 99.30 %
+    # "random_forest",     # Random Forest (test 0.35)              default: iris      98.11 %
+    # "xgboost",           # XGBoost + feature importance           default: iris      100 %
+    # "rf_xgb_cv",         # RF + XGBoost + 5-fold CV + importance (ChurnData)         78 % / 78 %
+    # "pca_knn",           # Pipeline Scaler->PCA->KNN + GridSearchCV  default: iris   0.900 / 0.933
+    # "sentiment",         # TF-IDF + Logistic Regression + Multinomial NB (SENTENCES or file)  50 % / 50 %
+    # "multinomial_nb",    # TF-IDF + Multinomial NB                default: 20newsgroups 87.88 %
+    # "kmeans",            # KMeans elbow method + cluster centres  default: iris
+    # "data_cleaning",     # SEPARATE question type (customers + purchases): duplicates, missing, IQR, merge, scaling, binning.
+                           # Not needed before other tasks - every model task already does its own class preprocessing.
+    # "auto",              # unknown question: runs every model that fits the data and ranks them
+]
+
+# STEP 3 - leave None unless the question asks for a change (None = exactly as in class)
+TARGET = None          # target column, e.g. "churn"
+FEATURES = None        # columns to use, e.g. ["ENGINESIZE"] or ["ed", "tenure", "income", "employ"]
+TEST_SIZE = None       # e.g. 0.1 or 0.3
+SEED = None            # random_state of train_test_split
+STRATIFY = None        # True / False
+K = None               # KNN neighbours / KMeans clusters (class: knn 4, kmeans 3 - the notebook also tried 4)
+MAX_DEPTH = None       # tree depth, e.g. 3, 5, 12
+CRITERION = None       # "entropy" or "gini"
+SHOW_PLOTS = True
+
+# STEP 4 - only for "sentiment" without a file: type / paste the sentences and labels
+SENTENCES = {
+    "text": [" I absolutely love this product, it works perfectly!",
+             "This is the worst purchase I have ever made.",
+             "It's okay, nothing special but does the job.",
+             "Fantastic customer service and beautiful design.",
+             "Horrible quality, it broke on the first day.",
+             "I am highly satisfied with the fast shipping.",
+             "Waste of money. Do not buy this product.",
+             "Pretty good value for the price, I recommend it.",
+             "item arrived late and the product was damaged, very disappointed."],
+    "sentiment": ["positive", "negative", "neutral", "positive", "negative",
+                  "positive", "negative", "positive", "negative"],
+}
+NEW_TEXTS = ["The item arrived broken and late.", "it is an amazing product",
+             "It works incredibly well, love it!", "not worht the money", "looks good"]
+
+
+# %% ==================== CELL 3: ALL METHODS (run once - nothing runs here) ====================
+BUILTIN = {"iris": datasets.load_iris, "wine": datasets.load_wine, "breast_cancer": datasets.load_breast_cancer,
+           "digits": datasets.load_digits, "diabetes": datasets.load_diabetes}
+HINTS = ["churn", "class", "target", "label", "labels", "sentiment", "category", "y", "outcome", "species",
+         "diagnosis", "survived", "output", "result", "price"]
+
+
+def opt(value, default):
+    return default if value is None else value
+
+
+def find_file(p):
+    if p.startswith("http") or os.path.isfile(p):
+        return p
+    for d in [".", "~/Downloads", "~/Desktop", "~/Documents", "/kaggle/input"]:
+        hits = glob.glob(os.path.join(os.path.expanduser(d), "**", os.path.basename(p)), recursive=True)
+        if hits:
+            return hits[0]
+    raise SystemExit(f"File not found: {p}  -> check DATA_PATH")
+
+
+def read_file(path):
+    p = find_file(path.strip())
+    ext = os.path.splitext(p.split("?")[0])[1].lower()
+    head = b"" if p.startswith("http") else open(p, "rb").read(8)
+    if ext in (".xlsx", ".xls", ".xlsm") or head[:2] in (b"PK", b"\xd0\xcf"):
+        df = pd.read_excel(p)
+    elif ext == ".json":
+        df = pd.read_json(p)
+    else:
+        try:
+            df = pd.read_csv(p)
+        except UnicodeDecodeError:
+            df = pd.read_csv(p, encoding="latin-1")
+        if df.shape[1] == 1:
+            df = pd.read_csv(p, sep=None, engine="python", encoding_errors="replace")
+    df.columns = [str(c).strip() for c in df.columns]
+    return df.loc[:, ~df.columns.str.startswith("Unnamed")]
+
+
+def load(default=None):
+    src = DATA_PATH.strip() or default
+    if not src:
+        raise SystemExit("This task needs a data file -> put its path in DATA_PATH")
+    key = src.lower().replace("load_", "").replace("fetch_", "")
+    if key in BUILTIN:
+        b = BUILTIN[key]()
+        df = pd.DataFrame(b.data, columns=[str(c) for c in b.feature_names])
+        df["target"] = b.target
+        return df, (list(b.target_names) if "target_names" in b else None)
+    if key == "20newsgroups":
+        try:
+            b = datasets.fetch_20newsgroups(subset="all")
+        except Exception:
+            raise SystemExit("20newsgroups is not downloaded on this PC (needs internet once).")
+        return pd.DataFrame({"text": b.data, "target": b.target}), list(b.target_names)
+    if key == "paste":
+        return pd.DataFrame(SENTENCES), None
+    df = read_file(src)
+    print(f"Loaded {src}  shape {df.shape}")
+    return df, None
+
+
+def pick_target(df, default=None):
+    if TARGET and TARGET not in df.columns:
+        print(f"!! TARGET '{TARGET}' not found. Columns: {list(df.columns)}")
+    for t in (TARGET, default):
+        if t and t in df.columns:
+            return t
+    low = {c.lower(): c for c in df.columns}
+    return next((low[h] for h in HINTS if h in low), df.columns[-1])
+
+
+def encode(X):
+    X = X.copy()
+    for c in X.columns:
+        if not pd.api.types.is_numeric_dtype(X[c]) or pd.api.types.is_bool_dtype(X[c]):
+            X[c] = LabelEncoder().fit_transform(X[c].astype(str))
+    return X
+
+
+def xy(df, target, default=None, drop=()):
+    if FEATURES:
+        missing = [f for f in FEATURES if f not in df.columns]
+        if missing:
+            raise SystemExit(f"FEATURES not found: {missing}. Columns: {list(df.columns)}")
+    cols = FEATURES or (default if default and set(default) <= set(df.columns)
+                        else [c for c in df.columns if c != target and c not in drop])
+    cols = [c for c in cols if c != target]
+    d = df[list(cols) + [target]].dropna()
+    print(f"Target: '{target}' | features ({len(cols)}): {list(cols)}")
+    return encode(d[list(cols)]), d[target]
+
+
+def codes(y, names=None):
+    if pd.api.types.is_numeric_dtype(y) and names is None:
+        return np.asarray(y), None
+    le = LabelEncoder()
+    yy = le.fit_transform(y if pd.api.types.is_numeric_dtype(y) else y.astype(str))
+    return yy, names or [str(c) for c in le.classes_]
+
+
+def split(X, y, test=0.2, seed=42, strat=False):
+    test, seed, strat = opt(TEST_SIZE, test), opt(SEED, seed), opt(STRATIFY, strat)
+    ok = strat and pd.Series(np.asarray(y)).value_counts().min() >= 2
+    print(f"train_test_split(test_size={test}, random_state={seed}, stratify={'y' if ok else None})")
+    return train_test_split(X, y, test_size=test, random_state=seed, stratify=y if ok else None)
+
+
+def need_numeric(y, target):
+    if not pd.api.types.is_numeric_dtype(y):
+        raise SystemExit(f"Target '{target}' is text ({list(y.unique()[:5])}...) -> this is CLASSIFICATION, "
+                         f"not regression. Use logistic / decision_tree / knn / auto, or set TARGET.")
+
+
+def need_classes(y, target):
+    y = pd.Series(y).dropna()
+    if pd.api.types.is_numeric_dtype(y) and not pd.api.types.is_bool_dtype(y) and (
+            y.nunique() > 50 or (pd.api.types.is_float_dtype(y) and not np.all(np.mod(y, 1) == 0))):
+        raise SystemExit(f"Target '{target}' is continuous ({y.nunique()} different numbers) -> this is REGRESSION. "
+                         f"Use simple_linear / multiple_linear / tree_regressor / auto, or set TARGET.")
+
+
+def is_classification(y):
+    if not pd.api.types.is_numeric_dtype(y) or pd.api.types.is_bool_dtype(y):
+        return True
+    if pd.api.types.is_float_dtype(y) and not np.all(np.mod(y, 1) == 0):
+        return False
+    return y.nunique() <= max(20, 0.05 * len(y)) and y.nunique() < 0.5 * len(y)
+
+
+def header(t):
+    print("\n" + "=" * 70 + f"\n{t}\n" + "=" * 70)
+
+
+def report(name, model, x_test, y_test, names=None):
+    y_test = np.asarray(y_test)
+    p = model.predict(x_test)
+    cls = np.unique(np.concatenate([y_test, p]))
+    lab = [str(names[c]) if names is not None and isinstance(c, (int, np.integer)) and c < len(names) else str(c)
+           for c in cls]
+    acc = accuracy_score(y_test, p)
+    print(f"\n--- {name} ---\nAccuracy: {acc * 100:.2f}%  ({acc:.4f})\n")
+    print(classification_report(y_test, p, labels=cls, target_names=lab, zero_division=0))
+    cm = confusion_matrix(y_test, p, labels=cls)
+    print("Confusion matrix:\n", cm)
+    binary = len(cls) == 2
+    kw = dict(average="binary", pos_label=cls[1]) if binary else dict(average="macro")
+    pr, rc, f1 = (f(y_test, p, zero_division=0, **kw) for f in (precision_score, recall_score, f1_score))
+    print(f"Precision {pr:.4f} | Recall {rc:.4f} | F1 {f1:.4f}  ({'positive class = ' + lab[1] if binary else 'macro'})")
+    if binary:
+        tn, fp, fn, tp = cm.ravel()
+        print(f"TP={tp}  TN={tn}  FP={fp}  FN={fn}  |  Specificity TN/(TN+FP) = {tn / max(tn + fp, 1):.4f}")
+        if hasattr(model, "predict_proba") and len(np.unique(y_test)) == 2:
+            score = model.predict_proba(x_test)[:, list(model.classes_).index(cls[1])]
+            auc = roc_auc_score(y_test == cls[1], score)
+            print(f"ROC-AUC: {auc:.4f}")
+            if SHOW_PLOTS:
+                fpr, tpr, _ = roc_curve(y_test == cls[1], score)
+                plt.figure(figsize=(5, 4)); plt.plot(fpr, tpr, label=f"AUC = {auc:.3f}"); plt.plot([0, 1], [0, 1], "--")
+                plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate"); plt.title(f"{name} ROC curve")
+                plt.legend(); plt.show()
+    if SHOW_PLOTS and len(cls) <= 25:
+        plt.figure(figsize=(max(5, .6 * len(cls)), max(4, .5 * len(cls))))
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=lab, yticklabels=lab)
+        plt.title(f"{name} confusion matrix"); plt.xlabel("Predicted"); plt.ylabel("Actual"); plt.show()
+    return acc
+
+
+def reg_report(y_test, y_pred):
+    mse = mean_squared_error(y_test, y_pred)
+    print(f"mean absolute error: {mean_absolute_error(y_test, y_pred):.2f}")
+    print(f"mean squared error: {mse:.3f}")
+    print(f"root mean squared error: {np.sqrt(mse):.2f}")
+    print(f"r2-score: {r2_score(y_test, y_pred):.3f}")
+    return r2_score(y_test, y_pred)
+
+
+def importance(model, cols, title, top=5):
+    imp = model.feature_importances_
+    idx = np.argsort(imp)[::-1]
+    print(f"\nTop {min(top, len(idx))} important features ({title}):")
+    for r, i in enumerate(idx[:top], 1):
+        print(f"{r}. {cols[i]}: {imp[i]:.4f}")
+    if SHOW_PLOTS:
+        k = min(15, len(idx))
+        plt.figure(figsize=(7, .35 * k + 1.5))
+        plt.barh([cols[i] for i in idx[:k]][::-1], imp[idx[:k]][::-1], color="skyblue")
+        plt.title(f"{title} feature importance"); plt.tight_layout(); plt.show()
+
+
+def make_xgb(n_classes):
+    if not HAS_XGB:
+        print("(xgboost not installed -> sklearn GradientBoosting used instead)")
+        return XGBClassifier(random_state=42)
+    if n_classes > 2:
+        return XGBClassifier(objective="multi:softprob", num_class=n_classes, random_state=42, eval_metric="mlogloss")
+    return XGBClassifier(n_estimators=100, learning_rate=0.1, random_state=42, eval_metric="logloss")
+
+
+def text_column(df, target, min_words=0):
+    best, best_n = None, min_words
+    for c in df.columns:
+        if c != target and not pd.api.types.is_numeric_dtype(df[c]):
+            n = df[c].dropna().astype(str).str.split().str.len().mean()
+            if n > best_n:
+                best, best_n = c, n
+    return best
+
+
+def text_data(default, max_df):
+    df, names = load(default)
+    target = pick_target(df, "sentiment")
+    need_classes(df[target], target)
+    tcol = text_column(df, target)
+    if tcol is None:
+        raise SystemExit(f"No text column found in {list(df.columns)}")
+    d = df[[tcol, target]].dropna()
+    print(f"Text column: '{tcol}' | target: '{target}' | rows: {len(d)}")
+    y, names = codes(d[target] if names else d[target].astype(str), names)
+    x_train, x_test, y_train, y_test = split(d[tcol].astype(str), y)
+    vec = TfidfVectorizer(stop_words="english", lowercase=True, max_df=max_df)
+    return vec, vec.fit_transform(x_train), vec.transform(x_test), y_train, y_test, names
+
+
+# ==================== START: simple_linear ====================
+def simple_linear():
+    header("SIMPLE LINEAR REGRESSION")
+    df, _ = load()
+    target = pick_target(df, "CO2EMISSIONS")
+    need_numeric(df[target], target)
+    num = df.drop(columns=[target]).select_dtypes("number")
+    if num.empty and not FEATURES:
+        raise SystemExit("No numeric feature column for linear regression -> set FEATURES")
+    feat = (FEATURES or (["ENGINESIZE"] if "ENGINESIZE" in df.columns else [num.corrwith(df[target]).abs().idxmax()]))[0]
+    d = df[[feat, target]].dropna()
+    print(f"x = '{feat}'  ->  y = '{target}'")
+    x, y = d[feat].to_numpy(), d[target].to_numpy()
+    x_train, x_test, y_train, y_test = split(x, y)
+    regressor = LinearRegression().fit(x_train.reshape(-1, 1), y_train)
+    print("coefficient:", regressor.coef_[0])
+    print("intercept:", regressor.intercept_)
+    y_pred = regressor.predict(x_test.reshape(-1, 1))
+    reg_report(y_test, y_pred)
+    if SHOW_PLOTS:
+        for xs, ys, part in [(x_train, y_train, "training"), (x_test, y_test, "test")]:
+            plt.scatter(xs, ys, color="red", label=f"actual {part} data")
+            plt.plot(xs, regressor.coef_[0] * xs + regressor.intercept_, "-b", label="regression line")
+            plt.xlabel(feat); plt.ylabel(target); plt.title(f"Regression model on {part} data"); plt.legend(); plt.show()
+
+# ==================== END: simple_linear ====================
+
+
+# ==================== START: multiple_linear ====================
+def multiple_linear():
+    header("MULTIPLE LINEAR REGRESSION")
+    df, _ = load()
+    target = pick_target(df, "CO2EMISSIONS")
+    need_numeric(df[target], target)
+    num = df.select_dtypes("number").loc[:, lambda d: d.nunique() > 1]
+    print("Correlation with target:\n", num.corr()[target].drop(target).round(3))
+    if num.shape[1] < 2 and not FEATURES:
+        raise SystemExit("No numeric feature columns for multiple linear regression -> set FEATURES")
+    default = ["ENGINESIZE", "FUELCONSUMPTION_COMB", "FUELCONSUMPTION_COMB_MPG"]
+    X, y = xy(df, target, default if set(default) <= set(df.columns) else list(num.columns))
+    if SHOW_PLOTS:
+        pd.plotting.scatter_matrix(pd.concat([X, y], axis=1), alpha=0.2, figsize=(8, 8)); plt.show()
+    std_scaler = StandardScaler()
+    x_std = std_scaler.fit_transform(X.to_numpy())
+    x_train, x_test, y_train, y_test = split(x_std, y.to_numpy())
+    regressor = LinearRegression().fit(x_train, y_train)
+    coef_, intercept_ = regressor.coef_, regressor.intercept_
+    print("coefficient (standardized):", coef_)
+    print("intercept (standardized):", intercept_)
+    std_devs = np.sqrt(std_scaler.var_)
+    print("coefficient (original scale):", coef_ / std_devs)
+    print("intercept (original scale):", intercept_ - np.sum(std_scaler.mean_ * coef_ / std_devs))
+    reg_report(y_test, regressor.predict(x_test))
+
+# ==================== END: multiple_linear ====================
+
+
+# ==================== START: tree_regressor ====================
+def tree_regressor():
+    header("DECISION TREE REGRESSOR")
+    df, _ = load()
+    target = pick_target(df, "tip_amount")
+    need_numeric(df[target], target)
+    X, y = xy(df, target)
+    if SHOW_PLOTS:
+        pd.concat([X, y], axis=1).corr()[target].drop(target).plot(kind="barh", figsize=(10, 6))
+        plt.title(f"correlation with {target}"); plt.show()
+    x = normalize(X.values, axis=1, norm="l1", copy=False)
+    x_train, x_test, y_train, y_test = split(x, y.values.astype("float32"), test=0.3)
+    for depth in sorted({opt(MAX_DEPTH, 8), 8, 12}):
+        dt_reg = DecisionTreeRegressor(criterion="squared_error", max_depth=depth, random_state=35).fit(x_train, y_train)
+        y_pred = dt_reg.predict(x_test)
+        print(f"max_depth={depth:2d} | mse score: {mean_squared_error(y_test, y_pred):.3f} | "
+              f"r^2 score: {dt_reg.score(x_test, y_test):.3f}")
+        if depth == opt(MAX_DEPTH, 8):
+            main = dt_reg
+    importance(main, list(X.columns), f"Decision tree regressor (max_depth={opt(MAX_DEPTH, 8)})", top=3)
+
+# ==================== END: tree_regressor ====================
+
+
+# ==================== START: logistic ====================
+def logistic():
+    header("LOGISTIC REGRESSION")
+    df, names = load()
+    target = pick_target(df, "churn")
+    X, y = xy(df, target, ["tenure", "age", "address", "income", "ed", "employ", "equip"])
+    need_classes(y, target)
+    y, names = codes(y.astype(int) if pd.api.types.is_numeric_dtype(y) else y, names)
+    x_norm = StandardScaler().fit(X).transform(X)
+    x_train, x_test, y_train, y_test = split(x_norm, y, seed=4)
+    LR = LogisticRegression().fit(x_train, y_train)
+    yhat_prob = LR.predict_proba(x_test)
+    print("predictions (first 10):", LR.predict(x_test)[:10])
+    print("probabilities (first 5):\n", yhat_prob[:5].round(4))
+    print(f"\nlog loss: {log_loss(y_test, yhat_prob, labels=LR.classes_):.4f}   (lower = better)")
+    report("Logistic Regression", LR, x_test, y_test, names)
+    if SHOW_PLOTS and LR.coef_.shape[0] == 1:
+        pd.Series(LR.coef_[0], index=X.columns).sort_values().plot(kind="barh")
+        plt.title("feature coefficients in logistic regression"); plt.xlabel("coefficient value"); plt.show()
+
+# ==================== END: logistic ====================
+
+
+# ==================== START: ovr_ovo ====================
+def ovr_ovo():
+    header("LOGISTIC REGRESSION: ONE-VS-ALL and ONE-VS-ONE")
+    df, _ = load()
+    target = pick_target(df, "NObeyesdad")
+    need_classes(df[target], target)
+    df = df[list(FEATURES or [c for c in df.columns if c != target]) + [target]].dropna().reset_index(drop=True)
+    print(f"Target: '{target}'\nClass balance:\n{df[target].value_counts()}")
+    X = df.drop(columns=[target])
+    cont = X.select_dtypes(include="float").columns.tolist()
+    cat = [c for c in X.columns if not pd.api.types.is_numeric_dtype(X[c])]
+    parts = [X.drop(columns=cont + cat)]
+    if cont:
+        parts.append(pd.DataFrame(StandardScaler().fit_transform(X[cont]), columns=cont))
+    if cat:
+        encoder = OneHotEncoder(sparse_output=False, drop="first")
+        parts.append(pd.DataFrame(encoder.fit_transform(X[cat].astype(str)), columns=encoder.get_feature_names_out(cat)))
+    x = pd.concat(parts, axis=1)
+    y = df[target].astype("category")
+    names, y = [str(c) for c in y.cat.categories], y.cat.codes
+    x_train, x_test, y_train, y_test = split(x, y, strat=True)
+    try:
+        model_ova = LogisticRegression(multi_class="ovr", max_iter=1000)
+    except TypeError:
+        model_ova = OneVsRestClassifier(LogisticRegression(max_iter=1000))
+    model_ova.fit(x_train, y_train)
+    model_ovo = OneVsOneClassifier(LogisticRegression(max_iter=1000)).fit(x_train, y_train)
+    a = report("One vs All (OvA)", model_ova, x_test, y_test, names)
+    b = report("One vs One (OvO)", model_ovo, x_test, y_test, names)
+    print(f"\nOvA accuracy: {np.round(100 * a, 2)}%  |  OvO accuracy: {np.round(100 * b, 2)}%")
+    if SHOW_PLOTS:
+        coef = model_ova.coef_ if hasattr(model_ova, "coef_") else np.vstack([e.coef_ for e in model_ova.estimators_])
+        pd.Series(np.abs(coef).mean(axis=0), index=x.columns).sort_values().plot(kind="barh", figsize=(8, 8))
+        plt.title("feature importance (mean |coefficient|, OvA)"); plt.show()
+
+# ==================== END: ovr_ovo ====================
+
+
+# ==================== START: knn ====================
+def knn():
+    header("K-NEAREST NEIGHBOURS")
+    df, names = load()
+    target = pick_target(df, "custcat")
+    X, y = xy(df, target)
+    need_classes(y, target)
+    print("|correlation| with target:\n", X.corrwith(pd.Series(codes(y)[0], index=X.index)).abs()
+          .sort_values(ascending=False).round(4))
+    x_norm = StandardScaler().fit_transform(X)
+    x_train, x_test, y_train, y_test = split(x_norm, y.to_numpy())
+    k = min(opt(K, 4), len(x_train))
+    knn_model = KNeighborsClassifier(n_neighbors=k).fit(x_train, y_train)
+    print(f"test set accuracy (k={k}):", accuracy_score(y_test, knn_model.predict(x_test)))
+    report(f"KNN (k={k})", knn_model, x_test, y_test, names)
+    ks = min(10, len(x_train))
+    acc, std_acc = np.zeros(ks), np.zeros(ks)
+    for n in range(1, ks + 1):
+        y_hat = KNeighborsClassifier(n_neighbors=n).fit(x_train, y_train).predict(x_test)
+        acc[n - 1] = accuracy_score(y_test, y_hat)
+        std_acc[n - 1] = np.std(y_hat == y_test) / np.sqrt(y_hat.shape[0])
+    print("accuracy for k = 1..10:", acc.round(4))
+    print("the best accuracy was with", acc.max(), "with k=", acc.argmax() + 1)
+    if SHOW_PLOTS:
+        plt.plot(range(1, ks + 1), acc, "g")
+        plt.fill_between(range(1, ks + 1), acc - std_acc, acc + std_acc, alpha=0.10)
+        plt.ylabel("model accuracy"); plt.xlabel("number of neighbors (k)"); plt.tight_layout(); plt.show()
+
+# ==================== END: knn ====================
+
+
+# ==================== START: svm ====================
+def svm():
+    header("SUPPORT VECTOR MACHINE")
+    df, names = load("iris")
+    target = pick_target(df)
+    X, y = xy(df, target)
+    need_classes(y, target)
+    y, names = codes(y, names)
+    x_train, x_test, y_train, y_test = split(X, y, strat=True)
+    scaler = StandardScaler()
+    x_train_scaled = scaler.fit_transform(x_train)
+    x_test_scaled = scaler.fit_transform(x_test)
+    model = SVC(kernel="rbf", C=1.0, random_state=42).fit(x_train_scaled, y_train)
+    report("SVM (rbf, C=1.0)", model, x_test_scaled, y_test, names)
+    if SHOW_PLOTS and X.shape[1] >= 2:
+        xv = StandardScaler().fit_transform(X.iloc[:, :2])
+        vis = SVC(kernel="rbf", C=1.0, gamma="scale", random_state=42).fit(xv, y)
+        xx, yy = np.meshgrid(np.arange(xv[:, 0].min() - .5, xv[:, 0].max() + .5, 0.02),
+                             np.arange(xv[:, 1].min() - .5, xv[:, 1].max() + .5, 0.02))
+        z = vis.predict(np.c_[xx.ravel(), yy.ravel()]).reshape(xx.shape)
+        plt.figure(figsize=(8, 6)); plt.contourf(xx, yy, z, alpha=0.3, cmap=plt.cm.coolwarm)
+        sc = plt.scatter(xv[:, 0], xv[:, 1], c=y, cmap=plt.cm.coolwarm, edgecolors="k", s=40)
+        plt.legend(handles=sc.legend_elements()[0], labels=[str(n) for n in (names or np.unique(y))])
+        plt.xlabel(f"{X.columns[0]} (standardized)"); plt.ylabel(f"{X.columns[1]} (standardized)")
+        plt.title("SVM decision boundaries (first 2 features)"); plt.grid(True, linestyle="--", alpha=0.5); plt.show()
+
+# ==================== END: svm ====================
+
+
+# ==================== START: decision_tree ====================
+def decision_tree():
+    header("DECISION TREE CLASSIFIER")
+    builtin = not DATA_PATH.strip()
+    df, names = load("iris")
+    target = pick_target(df, "Drug")
+    X, y = xy(df, target)
+    need_classes(y, target)
+    if names:
+        y = y.map(dict(enumerate(names)))
+    print("Class distribution:\n", y.value_counts())
+    x_train, x_test, y_train, y_test = split(X, y, test=0.3, seed=42 if builtin else 32)
+    crit, depth = opt(CRITERION, "entropy"), opt(MAX_DEPTH, 8 if builtin else 4)
+    tree = DecisionTreeClassifier(criterion=crit, max_depth=depth, random_state=2).fit(x_train, y_train)
+    print(f"decision tree's Accuracy (criterion={crit}, max_depth={depth}):",
+          accuracy_score(y_test, tree.predict(x_test)))
+    report("Decision Tree", tree, x_test, y_test)
+    for c in ("entropy", "gini"):
+        accs = {d: accuracy_score(y_test, DecisionTreeClassifier(criterion=c, max_depth=d, random_state=2).fit(x_train, y_train)
+                                  .predict(x_test)) for d in (3, 4, 5, 8)}
+        print(f"{c:7s} accuracy by max_depth:", {d: round(a, 4) for d, a in accs.items()})
+    if SHOW_PLOTS:
+        plt.figure(figsize=(14, 8))
+        plot_tree(tree, feature_names=list(X.columns), class_names=[str(c) for c in tree.classes_], filled=True)
+        plt.show()
+
+# ==================== END: decision_tree ====================
+
+
+# ==================== START: imbalanced ====================
+def imbalanced():
+    header("IMBALANCED DATA: WEIGHTED DECISION TREE vs LINEAR SVM")
+    df, _ = load()
+    target = pick_target(df, "Class")
+    X, y = xy(df, target, drop=["Time"])
+    need_classes(y, target)
+    print("Class distribution (%):\n", (y.value_counts(normalize=True) * 100).round(3))
+    x = normalize(StandardScaler().fit_transform(X), norm="l1")
+    y, names = codes(y)
+    x_train, x_test, y_train, y_test = split(x, y, test=0.3)
+    w_train = compute_sample_weight("balanced", y_train)
+    dt = DecisionTreeClassifier(max_depth=opt(MAX_DEPTH, 4), random_state=35).fit(x_train, y_train, sample_weight=w_train)
+    svm_model = LinearSVC(class_weight="balanced", random_state=31, loss="hinge", fit_intercept=False).fit(x_train, y_train)
+    if len(np.unique(y)) == 2:
+        print(f"\nDecision tree roc-auc score: {roc_auc_score(y_test, dt.predict_proba(x_test)[:, 1]):.3f}")
+        print(f"SVM roc-auc score: {roc_auc_score(y_test, svm_model.decision_function(x_test)):.3f}")
+    report("Decision Tree (balanced weights)", dt, x_test, y_test, names)
+    report("Linear SVM (balanced)", svm_model, x_test, y_test, names)
+
+# ==================== END: imbalanced ====================
+
+
+# ==================== START: gaussian_nb ====================
+def gaussian_nb():
+    header("GAUSSIAN NAIVE BAYES")
+    df, names = load("iris")
+    target = pick_target(df, "Class")
+    X, y = xy(df, target)
+    need_classes(y, target)
+    y, names = codes(y, names)
+    if pd.Series(y).value_counts(normalize=True).min() < 0.1:
+        print("!! IMBALANCED data -> judge by minority-class precision / recall / F1 and ROC-AUC, not accuracy")
+    x_train, x_test, y_train, y_test = split(X, y)
+    model = GaussianNB().fit(x_train, y_train)
+    report("Gaussian Naive Bayes", model, x_test, y_test, names)
+
+# ==================== END: gaussian_nb ====================
+
+
+# ==================== START: random_forest ====================
+def random_forest():
+    header("RANDOM FOREST")
+    df, names = load("iris")
+    target = pick_target(df)
+    X, y = xy(df, target)
+    need_classes(y, target)
+    y, names = codes(y, names)
+    x_train, x_test, y_train, y_test = split(X, y, test=0.35)
+    rf_classifier = RandomForestClassifier(n_estimators=100, random_state=42).fit(x_train, y_train)
+    report("Random Forest", rf_classifier, x_test, y_test, names)
+    importance(rf_classifier, list(X.columns), "Random Forest")
+
+# ==================== END: random_forest ====================
+
+
+# ==================== START: xgboost ====================
+def xgboost():
+    header("XGBOOST")
+    df, names = load("iris")
+    target = pick_target(df)
+    X, y = xy(df, target)
+    need_classes(y, target)
+    le = LabelEncoder()
+    y = le.fit_transform(y)
+    names = names or [str(c) for c in le.classes_]
+    x_train, x_test, y_train, y_test = split(X, y)
+    model = make_xgb(len(le.classes_)).fit(x_train, y_train)
+    report("XGBoost", model, x_test, y_test, names)
+    importance(model, list(X.columns), "XGBoost")
+
+# ==================== END: xgboost ====================
+
+
+# ==================== START: rf_xgb_cv ====================
+def rf_xgb_cv():
+    header("RANDOM FOREST + XGBOOST + 5-FOLD CROSS-VALIDATION")
+    df, names = load()
+    target = pick_target(df, "churn")
+    X, y = xy(df, target)
+    need_classes(y, target)
+    le = LabelEncoder()
+    y = le.fit_transform(y)
+    names = names or [str(c) for c in le.classes_]
+    X_train, X_test, y_train, y_test = split(X, y, strat=True)
+    models = {"Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
+              "XGBoost": make_xgb(len(le.classes_))}
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    for name, model in models.items():
+        model.fit(X_train, y_train)
+        report(name, model, X_test, y_test, names)
+        cv_scores = cross_val_score(model, X_train, y_train, cv=kf, scoring="accuracy")
+        print(f"\n[5-Fold Cross-Validation Accuracy]\nScores per fold: {cv_scores}")
+        print(f"Mean Accuracy: {cv_scores.mean():.4f} (+/-{cv_scores.std() * 2:.4f})")
+        importance(model, list(X.columns), name)
+
+# ==================== END: rf_xgb_cv ====================
+
+
+# ==================== START: pca_knn ====================
+def pca_knn():
+    header("PIPELINE (StandardScaler -> PCA -> KNN) + GRIDSEARCHCV")
+    df, names = load("iris")
+    target = pick_target(df)
+    X, y = xy(df, target)
+    need_classes(y, target)
+    y, names = codes(y, names)
+    xtrain, xtest, ytrain, ytest = split(X, y, strat=True)
+    nf = X.shape[1]
+    pipeline = Pipeline([("scaler", StandardScaler()), ("pca", PCA(n_components=min(2, nf))),
+                         ("knn", KNeighborsClassifier(n_neighbors=5))]).fit(xtrain, ytrain)
+    print(f"pipeline test score: {pipeline.score(xtest, ytest):.3f}")
+    report("Pipeline Scaler+PCA(2)+KNN(5)", pipeline, xtest, ytest, names)
+    param_grid = {"pca__n_components": sorted({min(2, nf), min(3, nf)}), "knn__n_neighbors": [3, 5, 7]}
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    best_model = GridSearchCV(Pipeline([("scaler", StandardScaler()), ("pca", PCA()), ("knn", KNeighborsClassifier())]),
+                              param_grid=param_grid, cv=cv, scoring="accuracy", verbose=1).fit(xtrain, ytrain)
+    print(f"best params: {best_model.best_params_} | best CV score: {best_model.best_score_:.4f}")
+    print(f"grid search test score: {best_model.score(xtest, ytest):.3f}")
+    report("GridSearchCV best pipeline", best_model, xtest, ytest, names)
+
+# ==================== END: pca_knn ====================
+
+
+# ==================== START: sentiment ====================
+def sentiment():
+    header("SENTIMENT ANALYSIS: TF-IDF + LOGISTIC REGRESSION + MULTINOMIAL NB")
+    vec, x_train_vec, x_test_vec, ytrain, ytest, names = text_data("paste", 1.0)
+    lr_model = LogisticRegression().fit(x_train_vec, ytrain)
+    nb_model = MultinomialNB().fit(x_train_vec, ytrain)
+    a = report("Logistic Regression", lr_model, x_test_vec, ytest, names)
+    b = report("Multinomial Naive Bayes", nb_model, x_test_vec, ytest, names)
+    print(f"\n---Model Accuracy Comparison---\nLogistic regression accuracy: {a * 100:.2f}%\n"
+          f"Multinomial Naive bayes accuracy: {b * 100:.2f}%")
+    if NEW_TEXTS:
+        new_vec = vec.transform(NEW_TEXTS)
+        print("\n--- Testing Custom Input ---")
+        for text, lp, npred in zip(NEW_TEXTS, lr_model.predict(new_vec), nb_model.predict(new_vec)):
+            print(f"Text: '{text}'\n   -> LR Prediction: {str(names[lp]).upper()}\n"
+                  f"   -> NB Prediction: {str(names[npred]).upper()}")
+
+# ==================== END: sentiment ====================
+
+
+# ==================== START: multinomial_nb ====================
+def multinomial_nb():
+    header("TEXT CLASSIFICATION: TF-IDF + MULTINOMIAL NAIVE BAYES")
+    vec, x_train_tfidf, x_test_tfidf, ytrain, ytest, names = text_data("20newsgroups", 0.5)
+    nb_classifier = MultinomialNB().fit(x_train_tfidf, ytrain)
+    report("Multinomial Naive Bayes", nb_classifier, x_test_tfidf, ytest, names)
+
+# ==================== END: multinomial_nb ====================
+
+
+# ==================== START: kmeans ====================
+def kmeans():
+    header("K-MEANS CLUSTERING")
+    df, _ = load("iris")
+    drop = [c for c in [TARGET, "target"] if c and c in df.columns] if DATA_PATH.strip() == "" or TARGET else []
+    x = (encode(df[FEATURES]) if FEATURES else df.drop(columns=drop).select_dtypes("number")).dropna()
+    print(f"Clustering on {x.shape[1]} columns: {list(x.columns)}")
+    wcss = []
+    for i in range(1, 11):
+        wcss.append(KMeans(n_clusters=i, init="k-means++", random_state=42).fit(x).inertia_)
+    print("WCSS for k = 1..10:", np.round(wcss, 2))
+    if SHOW_PLOTS:
+        plt.figure(figsize=(6, 4)); plt.plot(range(1, 11), wcss, marker="o", linestyle="--")
+        plt.title("Elbow Method"); plt.xlabel("Number of clusters"); plt.ylabel("WCSS"); plt.show()
+    k = opt(K, 3)
+    model = KMeans(n_clusters=k, init="k-means++", random_state=42)
+    y_means = model.fit_predict(x)
+    print(f"\ncluster centres (k={k}):\n", model.cluster_centers_)
+    print("points per cluster:", {int(c): int(v) for c, v in pd.Series(y_means).value_counts().sort_index().items()})
+    if SHOW_PLOTS and x.shape[1] >= 2:
+        plt.scatter(x.iloc[:, 0], x.iloc[:, 1], c=y_means, cmap="viridis", s=40)
+        plt.scatter(model.cluster_centers_[:, 0], model.cluster_centers_[:, 1], c="red", marker="X", s=200)
+        plt.xlabel(x.columns[0]); plt.ylabel(x.columns[1]); plt.title(f"KMeans clusters (k={k})"); plt.show()
+
+# ==================== END: kmeans ====================
+
+
+# ==================== START: data_cleaning ====================
+def data_cleaning():
+    header("DATA CLEANING + MERGE + SCALING + ENCODING + BINNING")
+    customers = read_file(DATA_PATH or "customers_raw.csv").drop_duplicates()
+    customers.columns = customers.columns.str.strip()
+    print(customers.describe())
+    id_col = next((c for c in customers.columns if c.lower().endswith("id")), None)
+    numeric = [c for c in customers.columns if pd.api.types.is_numeric_dtype(customers[c])
+               and not pd.api.types.is_bool_dtype(customers[c]) and c != id_col]
+    for c in customers.columns:
+        if c in numeric:
+            customers[c] = customers[c].fillna(customers[c].median())
+            q1, q3 = customers[c].quantile(0.25), customers[c].quantile(0.75)
+            iqr = q3 - q1
+            customers[c] = customers[c].clip(q1 - 1.5 * iqr, q3 + 1.5 * iqr)
+        elif c != id_col and not pd.api.types.is_bool_dtype(customers[c]):
+            customers[c] = customers[c].fillna("Unknown").astype(str).str.strip().str.title()
+    print("\nAfter cleaning:\n", customers)
+    merged = customers
+    if DATA_PATH_2.strip():
+        purchases = read_file(DATA_PATH_2)
+        key = next((c for c in customers.columns if c in purchases.columns), None)
+        if key is None:
+            raise SystemExit("The two files have no common column to merge on")
+        merged = pd.merge(customers, purchases, on=key, how="left")
+        for c in purchases.columns:
+            if c != key and pd.api.types.is_numeric_dtype(merged[c]) and not pd.api.types.is_bool_dtype(merged[c]):
+                year_like = merged[c].dropna().between(1900, 2100).all()
+                merged[c] = merged[c].fillna(merged[c].median() if year_like else 0)
+        print(f"\nMerged on '{key}' (left join):\n", merged)
+    df_t = merged.copy()
+    if numeric:
+        df_t[[f"{c.lower()}_minmax" for c in numeric]] = MinMaxScaler().fit_transform(df_t[numeric])
+        df_t[[f"{c.lower()}_z" for c in numeric]] = StandardScaler().fit_transform(df_t[numeric])
+    text = [c for c in merged.columns if not pd.api.types.is_numeric_dtype(merged[c]) and c != id_col]
+    dummies = []
+    for c in text:
+        n = merged[c].nunique()
+        if n == 2:
+            df_t[f"{c.lower()}_encoded"] = LabelEncoder().fit_transform(df_t[c].astype(str))
+        elif 2 < n <= 10 and n < 0.8 * len(merged):
+            dummies.append(c)
+    df_t = pd.get_dummies(df_t, columns=dummies, prefix=dummies)
+    age = next((c for c in merged.columns if c.lower() == "age"), None)
+    if age and pd.api.types.is_numeric_dtype(merged[age]):
+        df_t["Age_group"] = pd.cut(merged[age], bins=[0, 25, 35, 50, 100], labels=["Young", "Adult", "Mid_age", "Senior"])
+    buy = next((c for c in merged.columns if "purchase" in c.lower() and pd.api.types.is_numeric_dtype(merged[c])), None)
+    if buy:
+        bins = [-1, 5, 10, 15, max(20, merged[buy].max())]
+        df_t["Loyalty_Group"] = pd.cut(merged[buy], bins=bins, labels=[1, 2, 3, 4])
+        df_t["Loyalty_Amount"] = pd.cut(merged[buy], bins=bins, labels=[100, 200, 300, 400])
+    pd.set_option("display.width", 250); pd.set_option("display.max_columns", 50)
+    print("\nFinal transformed data:\n", df_t)
+    return df_t
+
+# ==================== END: data_cleaning ====================
+
+
+# ==================== START: auto ====================
+def auto():
+    header("AUTO: every model that fits this data")
+    df, names = load("iris")
+    target = pick_target(df)
+    if text_column(df, target, min_words=3):
+        vec, xtr, xte, ytr, yte, names = text_data("iris", 1.0 if len(df) < 1000 else 0.5)
+        res = {n: report(n, m.fit(xtr, ytr), xte, yte, names)
+               for n, m in [("Multinomial NB", MultinomialNB()), ("Logistic Regression", LogisticRegression(max_iter=1000))]}
+    elif is_classification(df[target].dropna()):
+        X, y = xy(df, target)
+        y, names = codes(y, names)
+        y = LabelEncoder().fit_transform(y)
+        print("Detected: CLASSIFICATION", "(binary)" if len(np.unique(y)) == 2 else "(multiclass)")
+        x_train, x_test, y_train, y_test = split(X, y, strat=True)
+        scaled = lambda m: Pipeline([("scaler", StandardScaler()), ("model", m)])
+        models = {"Gaussian NB": GaussianNB(), "Logistic Regression": scaled(LogisticRegression(max_iter=1000)),
+                  "KNN (k=5)": scaled(KNeighborsClassifier()), "SVM (rbf)": scaled(SVC(probability=True, random_state=42)),
+                  "Decision Tree": DecisionTreeClassifier(criterion="entropy", max_depth=4, random_state=42),
+                  "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
+                  "XGBoost": make_xgb(len(np.unique(y)))}
+        res = {n: report(n, m.fit(x_train, y_train), x_test, y_test, names) for n, m in models.items()}
+    else:
+        X, y = xy(df, target)
+        print("Detected: REGRESSION")
+        x_train, x_test, y_train, y_test = split(X, y)
+        res = {}
+        for n, m in {"Linear Regression": LinearRegression(),
+                     "Decision Tree Regressor": DecisionTreeRegressor(max_depth=8, random_state=35),
+                     "Random Forest Regressor": RandomForestRegressor(n_estimators=100, random_state=42)}.items():
+            print(f"\n--- {n} ---")
+            res[n] = reg_report(y_test, m.fit(x_train, y_train).predict(x_test))
+    header("SUMMARY (higher = better: accuracy or R2)")
+    for n, s in sorted(res.items(), key=lambda kv: -kv[1]):
+        print(f"{n:28s} {s:.4f}")
+
+# ==================== END: auto ====================
+
+
+
+# %% ==================== CELL 4: RUN (re-run this after every change in CELL 2) ====================
+try:
+    TASKS
+except NameError:
+    raise SystemExit("Run CELL 2 (CONFIG) first, then this cell")
+if "report" not in globals():
+    raise SystemExit("Run CELL 1 and CELL 3 first, then this cell")
+if not TASKS:
+    print('No task selected - uncomment one line in TASKS (CELL 2)')
+results = {}
+for task in TASKS:
+    if callable(globals().get(task)):
+        results[task] = globals()[task]()
+    else:
+        print(f"'{task}' did not run: its section was deleted or the name is misspelled")
